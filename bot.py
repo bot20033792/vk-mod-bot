@@ -82,6 +82,7 @@ import os
 import random
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import vk_api
@@ -500,42 +501,54 @@ class VkCallbackHandler(BaseHTTPRequestHandler):
         self.wfile.write("Бот работает".encode("utf-8"))
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length) if length else b""
         try:
-            event = json.loads(raw.decode("utf-8")) if raw else {}
-        except json.JSONDecodeError:
-            self.send_response(400)
-            self.end_headers()
-            return
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b""
+            try:
+                event = json.loads(raw.decode("utf-8")) if raw else {}
+            except json.JSONDecodeError:
+                print("[callback] Не удалось разобрать JSON от VK, тело запроса:", raw[:500])
+                self.send_response(400)
+                self.end_headers()
+                return
 
-        event_type = event.get("type")
+            event_type = event.get("type")
+            print(f"[callback] Получено событие от VK: {event_type}")
 
-        # Подтверждение адреса сервера — обязательный первый шаг настройки
-        # Callback API в группе VK. Отвечаем строкой без кавычек, как требует VK.
-        if event_type == "confirmation":
-            self.send_response(200)
-            self.send_header("Content-type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(CONFIRMATION_CODE.encode("utf-8"))
-            return
+            # Подтверждение адреса сервера — обязательный первый шаг настройки
+            # Callback API в группе VK. Отвечаем строкой без кавычек, как требует VK.
+            if event_type == "confirmation":
+                self.send_response(200)
+                self.send_header("Content-type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(CONFIRMATION_CODE.encode("utf-8"))
+                return
 
-        # Если задан секретный ключ в config.json — проверяем, что событие
-        # действительно от VK (защита от посторонних запросов на этот адрес).
-        if CALLBACK_SECRET and event.get("secret") != CALLBACK_SECRET:
-            print("[callback] Событие с неверным secret — игнорируем")
+            # Если задан секретный ключ в config.json — проверяем, что событие
+            # действительно от VK (защита от посторонних запросов на этот адрес).
+            if CALLBACK_SECRET and event.get("secret") != CALLBACK_SECRET:
+                print("[callback] Событие с неверным secret — игнорируем")
+                self._respond_ok()
+                return
+
+            # Отвечаем VK "ok" сразу же, не дожидаясь обработки (проверка ИИ может
+            # занять пару секунд) — иначе VK решит, что доставка не удалась, и
+            # будет повторно слать то же событие.
             self._respond_ok()
-            return
 
-        # Отвечаем VK "ok" сразу же, не дожидаясь обработки (проверка ИИ может
-        # занять пару секунд) — иначе VK решит, что доставка не удалась, и
-        # будет повторно слать то же событие.
-        self._respond_ok()
-
-        if event_type == "message_new":
-            message = event.get("object", {}).get("message", {})
-            threading.Thread(target=process_message_safe, args=(message,), daemon=True).start()
-        # Остальные типы событий (message_edit, group_join и т.п.) пока не обрабатываем.
+            if event_type == "message_new":
+                message = event.get("object", {}).get("message", {})
+                print(f"[callback] message_new: from_id={message.get('from_id')} "
+                      f"text={message.get('text')!r}")
+                threading.Thread(target=process_message_safe, args=(message,), daemon=True).start()
+            # Остальные типы событий (message_edit, group_join и т.п.) пока не обрабатываем.
+        except Exception:
+            print("[callback] Необработанная ошибка в do_POST:")
+            traceback.print_exc()
+            try:
+                self._respond_ok()
+            except Exception:
+                pass
 
     def _respond_ok(self):
         self.send_response(200)
@@ -544,7 +557,11 @@ class VkCallbackHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"ok")
 
     def log_message(self, format, *args):
-        pass  # не засоряем логи Render служебными запросами
+        # Не засоряем логи запросами health-check пинг-сервиса (GET), но
+        # НЕ глушим ничего для POST — там могут быть реальные ошибки.
+        if self.command == "GET":
+            return
+        print("[http] " + (format % args))
 
 
 def main():
