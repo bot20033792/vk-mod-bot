@@ -55,6 +55,7 @@ VK-бот: автомодератор на чистом ИИ + ранги мод
 
 import json
 import os
+import random
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -65,6 +66,7 @@ from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 import storage
 import ai_moderation
 import ranks
+import achievements
 
 
 class _HealthCheckHandler(BaseHTTPRequestHandler):
@@ -98,8 +100,9 @@ VK_GROUP_TOKEN = os.environ.get("VK_GROUP_TOKEN") or CONFIG.get("vk_group_token"
 GROUP_ID = int(os.environ.get("VK_GROUP_ID") or CONFIG.get("group_id", 0))
 AI_API_KEY = os.environ.get("GROQ_API_KEY") or os.environ.get("AI_API_KEY") or CONFIG.get("ai", {}).get("api_key")
 
-# moderators: список объектов {"id":.., "level":..} -> словарь id -> level
-MODERATORS = {m["id"]: m["level"] for m in CONFIG.get("moderators", [])}
+# moderators: список объектов {"id":.., "level":..} (или {"screen_name":.., "level":..},
+# если числовой ID ещё не известен — см. resolve_moderators() ниже) -> словарь id -> level
+MODERATORS = {m["id"]: m["level"] for m in CONFIG.get("moderators", []) if m.get("id")}
 WARNINGS_BEFORE_MUTE = CONFIG.get("warnings_before_mute", 3)
 MUTE_DURATION_MINUTES = CONFIG.get("mute_duration_minutes", 20)
 RULES_TEXT = CONFIG.get("rules_text", "").strip()
@@ -114,6 +117,72 @@ if not GROUP_ID:
 vk_session = vk_api.VkApi(token=VK_GROUP_TOKEN)
 vk = vk_session.get_api()
 longpoll = VkBotLongPoll(vk_session, GROUP_ID)
+
+
+def resolve_moderators():
+    """Даёт возможность указать модератора в config.json по короткому имени
+    страницы (screen_name, например "lomtev_shadow12"), если числовой ID
+    ещё не известен. При старте бот сам определяет ID через VK API
+    (utils.resolveScreenName) и дозаписывает его в config.json — дальше
+    используется уже сохранённый числовой ID."""
+    global MODERATORS
+    changed = False
+    for m in CONFIG.get("moderators", []):
+        if m.get("id") or not m.get("screen_name"):
+            continue
+        try:
+            resolved = vk.utils.resolveScreenName(screen_name=m["screen_name"])
+            if resolved and resolved.get("type") == "user":
+                m["id"] = resolved["object_id"]
+                changed = True
+                print(f"[moderators] {m['screen_name']} -> id{m['id']}")
+            else:
+                print(f"[moderators] Не удалось определить ID для {m['screen_name']}, "
+                      f"проверь имя страницы")
+        except vk_api.exceptions.ApiError as e:
+            print(f"[moderators] Ошибка resolveScreenName для {m['screen_name']}: {e}")
+    if changed:
+        MODERATORS = {m["id"]: m["level"] for m in CONFIG.get("moderators", []) if m.get("id")}
+        save_config()
+
+
+resolve_moderators()
+
+
+def notify_staff(user_id: int, message_text: str, reason: str, action_taken: str):
+    """Личное уведомление каждому модератору/администратору/владельцу
+    (все, кто есть в MODERATORS) о нарушении — сразу, автоматически."""
+    text = (
+        f"🚨 Нарушение в чате\n"
+        f"Участник: [id{user_id}|id{user_id}] (vk.com/id{user_id})\n"
+        f"Действие бота: {action_taken}\n"
+        f"Причина: {reason}\n"
+        f"Сообщение: {(message_text or '')[:300]}"
+    )
+    for staff_id in MODERATORS:
+        try:
+            vk.messages.send(user_id=staff_id, message=text, random_id=random.randint(1, 2**31 - 1))
+        except vk_api.exceptions.ApiError as e:
+            print(f"[notify_staff] Не удалось написать модератору id{staff_id}: {e}")
+
+
+def announce_new_achievements(peer_id: int, user_id: int, new_items):
+    """Объявляет в чате о новых нашивках/антинашивках сразу после того,
+    как achievements.check_achievements() их выдал."""
+    for kind, code, name in new_items:
+        if kind == "achievement":
+            send_message(peer_id, f"🏆 [id{user_id}|Участник] получает нашивку: {name}!")
+        else:
+            send_message(peer_id, f"⚠️ [id{user_id}|Участнику] выдана антинашивка: {name}.")
+
+
+def is_repost(message: dict) -> bool:
+    """True, если сообщение — пересланная запись (репост) со стены другого
+    паблика/канала, а не собственный текст автора."""
+    for att in message.get("attachments", []):
+        if att.get("type") == "wall":
+            return True
+    return False
 
 
 def send_message(peer_id: int, text: str):
@@ -146,6 +215,7 @@ def apply_mute(peer_id: int, user_id: int, reason: str):
     until_ts = time.time() + MUTE_DURATION_MINUTES * 60
     storage.set_mute(user_id, until_ts)
     storage.reset_warnings(user_id)
+    storage.increment_stat(user_id, "total_mutes_ever")
     send_message(
         peer_id,
         f"[id{user_id}|Пользователь] получает мут на {MUTE_DURATION_MINUTES} мин. "
@@ -160,6 +230,7 @@ def apply_punishment(action: str, peer_id: int, user_id: int, message_id: int, r
         if action == "delete_and_warn":
             delete_message(peer_id, message_id)
         warn_count = storage.add_warning(user_id)
+        storage.increment_stat(user_id, "total_warnings_ever")
         send_message(
             peer_id,
             f"[id{user_id}|Пользователь], предупреждение ({warn_count}/{WARNINGS_BEFORE_MUTE}). "
@@ -174,6 +245,13 @@ def apply_punishment(action: str, peer_id: int, user_id: int, message_id: int, r
         apply_mute(peer_id, user_id, reason)
 
     storage.log_action(user_id, peer_id, message_id, action_taken, reason, text)
+
+    # Уведомляем модераторов/администратора/владельца в личку — автоматически
+    notify_staff(user_id, text, reason, action_taken)
+
+    # Проверяем и сразу выдаём (навсегда) новые нашивки/антинашивки
+    new_items = achievements.check_achievements(user_id)
+    announce_new_achievements(peer_id, user_id, new_items)
 
 
 # ---------- Команды модераторов ----------
@@ -285,6 +363,7 @@ def handle_public_command(peer_id: int, user_id: int, lowered_text: str) -> bool
         if mute_until:
             minutes_left = max(0, int((mute_until - time.time()) / 60) + 1)
             lines.append(f"⛔ В муте ещё ~{minutes_left} мин.")
+        lines.append(achievements.format_profile_block(user_id))
         send_message(peer_id, "\n".join(lines))
         return True
 
@@ -346,6 +425,11 @@ def main():
                 f"({new_total} сообщ.)!"
             )
 
+        # Нашивки/антинашивки за общее число сообщений (например "Ветеран чата",
+        # "Чистая репутация") проверяем после каждого сообщения — независимо
+        # от нашивок активности выше.
+        announce_new_achievements(peer_id, user_id, achievements.check_achievements(user_id))
+
         # Модераторов бот не наказывает
         if user_id in MODERATORS:
             continue
@@ -355,6 +439,18 @@ def main():
         mute_until = storage.get_mute_until(user_id)
         if mute_until:
             delete_message(peer_id, message_id)
+            continue
+
+        # Репост (пересланная запись) из чужого паблика/канала — запрещено
+        # правилами (п. 3.1), проверяется без ИИ: удаляем, предупреждаем,
+        # указываем конкретный пункт правил.
+        if is_repost(message):
+            storage.increment_stat(user_id, "total_reposts_ever")
+            apply_punishment(
+                "delete_and_warn", peer_id, user_id, message_id,
+                "публикация записи/поста из чужого паблика или канала (п. 3.1 правил чата)",
+                text
+            )
             continue
 
         if not AI_CONFIG.get("enabled"):

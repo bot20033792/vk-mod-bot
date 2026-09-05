@@ -61,8 +61,115 @@ def init_db():
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_message_log_ts ON message_log (ts)")
+
+    # ---- Нашивки и антинашивки (achievements.py) — хранятся навсегда ----
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS achievements (
+            user_id INTEGER NOT NULL,
+            code TEXT NOT NULL,
+            unlocked_at REAL NOT NULL,
+            PRIMARY KEY (user_id, code)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS badges (
+            user_id INTEGER NOT NULL,
+            code TEXT NOT NULL,
+            unlocked_at REAL NOT NULL,
+            PRIMARY KEY (user_id, code)
+        )
+    """)
+    # Счётчики "за всё время" — не сбрасываются при муте/погашении предупреждений,
+    # нужны только для проверки условий нашивок/антинашивок.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_stats (
+            user_id INTEGER PRIMARY KEY,
+            total_warnings_ever INTEGER NOT NULL DEFAULT 0,
+            total_mutes_ever INTEGER NOT NULL DEFAULT 0,
+            total_reposts_ever INTEGER NOT NULL DEFAULT 0
+        )
+    """)
     conn.commit()
     conn.close()
+
+
+# ---------- Счётчики для нашивок/антинашивок (навсегда, без сброса) ----------
+
+_STAT_COLUMNS = ("total_warnings_ever", "total_mutes_ever", "total_reposts_ever")
+
+
+def increment_stat(user_id: int, field: str, amount: int = 1):
+    if field not in _STAT_COLUMNS:
+        raise ValueError(f"Неизвестный счётчик: {field}")
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("INSERT OR IGNORE INTO user_stats (user_id) VALUES (?)", (user_id,))
+    cur.execute(f"UPDATE user_stats SET {field} = {field} + ? WHERE user_id = ?", (amount, user_id))
+    conn.commit()
+    conn.close()
+
+
+def get_stats(user_id: int) -> dict:
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT total_warnings_ever, total_mutes_ever, total_reposts_ever "
+        "FROM user_stats WHERE user_id = ?", (user_id,)
+    )
+    row = cur.fetchone()
+    conn.close()
+    if row is None:
+        return {col: 0 for col in _STAT_COLUMNS}
+    return dict(zip(_STAT_COLUMNS, row))
+
+
+# ---------- Нашивки (достижения) — навсегда ----------
+
+def unlock_achievement(user_id: int, code: str) -> bool:
+    """True, если нашивка выдана впервые (иначе она уже была раньше)."""
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO achievements (user_id, code, unlocked_at) VALUES (?, ?, ?)",
+        (user_id, code, time.time())
+    )
+    conn.commit()
+    added = cur.rowcount > 0
+    conn.close()
+    return added
+
+
+def get_user_achievements(user_id: int):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("SELECT code FROM achievements WHERE user_id = ?", (user_id,))
+    rows = [r[0] for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+# ---------- Антинашивки (плохие нашивки) — навсегда ----------
+
+def unlock_badge(user_id: int, code: str) -> bool:
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO badges (user_id, code, unlocked_at) VALUES (?, ?, ?)",
+        (user_id, code, time.time())
+    )
+    conn.commit()
+    added = cur.rowcount > 0
+    conn.close()
+    return added
+
+
+def get_user_badges(user_id: int):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("SELECT code FROM badges WHERE user_id = ?", (user_id,))
+    rows = [r[0] for r in cur.fetchall()]
+    conn.close()
+    return rows
 
 
 # ---------- Предупреждения ----------
