@@ -3,79 +3,78 @@ import threading
 import time
 import requests
 from aiohttp import web
-import vk_api
+from groq import Groq
 
-# ---------------------------------------------------------
-# 1. БЛОК ПОДДЕРЖКИ ОНЛАЙНА (Keep-Alive)
-# ---------------------------------------------------------
-# Этот поток каждые 5 минут стучится в сам себя, чтобы Render не усыплял сервис.
+# Настройки подключения
+KEEP_ALIVE_URL = "https://vk-mod-bot-e8ee.onrender.com"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+CONFIRMATION_CODE = os.getenv("VK_CALLBACK_CONFIRMATION", "b84ecffe")
+
+# Проверка наличия API ключа
+if not GROQ_API_KEY:
+    print("Ошибка: GROQ_API_KEY не найден в переменных окружения!")
+    exit(1)
+
+client = Groq(api_key=GROQ_API_KEY)
+
+# Keep-Alive для Render
 def keep_alive():
     while True:
         try:
-            # Вставь сюда свой URL на Render
-            url = "https://vk-mod-bot-e8ee.onrender.com"
-            requests.get(url, timeout=5)
+            requests.get(KEEP_ALIVE_URL, timeout=5)
             print("Keep-alive ping sent")
         except Exception as e:
             print(f"Keep-alive error: {e}")
         time.sleep(300)
 
-# Запускаем поток сразу при старте скрипта
 threading.Thread(target=keep_alive, daemon=True).start()
 
-# ---------------------------------------------------------
-# 2. НАСТРОЙКИ И ИНИЦИАЛИЗАЦИЯ
-# ---------------------------------------------------------
-# Получаем токены из переменных окружения (Render Dashboard)
-VK_TOKEN = os.getenv("VK_GROUP_TOKEN")
-CONFIRMATION_CODE = os.getenv("VK_CALLBACK_CONFIRMATION", "b84ecffe")
-
-# Инициализация API ВКонтакте
-vk_session = vk_api.VkApi(token=VK_TOKEN)
-vk = vk_session.get_api()
-
-# ---------------------------------------------------------
-# 3. ОБРАБОТЧИК ЗАПРОСОВ (MAIN LOGIC)
-# ---------------------------------------------------------
+# Обработчик подтверждения
 async def handle_post(request):
     try:
-        # Парсим входящий JSON от ВКонтакте
         data = await request.json()
-        
-        # САМОЕ ВАЖНОЕ: Проверка типа запроса
         req_type = data.get('type')
         
-        # Если это запрос на подтверждение сервера — отдаем ТОЛЬКО код
         if req_type == 'confirmation':
             return web.Response(text=CONFIRMATION_CODE)
         
-        # Если это событие (например, новое сообщение) — обрабатываем
+        # Обработка сообщений
         if req_type == 'message_new':
             obj = data.get('object', {})
             message = obj.get('message', {})
             text = message.get('text', '')
             peer_id = message.get('peer_id')
             
-            # --- ТВОЯ ЛОГИКА ЗДЕСЬ ---
-            # Пример: отвечаем на любое сообщение
-            if text:
-                vk.messages.send(
-                    peer_id=peer_id,
-                    message=f"Бот получил: {text}",
-                    random_id=0
+            # Простая обработка сообщений через ИИ
+            try:
+                response = client.chat.completions.create(
+                    model="llama3-1-8b-instruct",
+                    messages=[
+                        {"role": "system", "content": "Ты — дружелюбный бот-помощник."},
+                        {"role": "user", "content": text}
+                    ],
+                    temperature=0.7,
+                    max_tokens=512
                 )
-            # -------------------------
+                ai_response = response.choices[0].message.content
+                
+                # Отправляем ответ в ВК
+                # Здесь нужно добавить код для отправки сообщения через VK API
+                # Но для минимального запуска пока пропустим эту часть
+                
+            except Exception as e:
+                print(f"Ошибка ИИ: {e}")
+                ai_response = "Сейчас я немного задумался, попробуйте позже!"
             
-        # Если тип запроса не известен или обработан — возвращаем 'ok'
+            # TODO: Добавить отправку ответа через VK API
+            
         return web.Response(text='ok')
 
     except Exception as e:
-        print(f"Ошибка обработки запроса: {e}")
-        return web.Response(status=500, text="Internal Server Error")
+        print(f"Ошибка обработки: {e}")
+        return web.Response(status=500)
 
-# ---------------------------------------------------------
-# 4. ЗАПУСК СЕРВЕРА
-# ---------------------------------------------------------
+# Запуск сервера
 app = web.Application()
 app.router.add_post('/', handle_post)
 
