@@ -8,10 +8,9 @@ VK-бот: автомодератор на чистом ИИ + ранги мод
   открытый HTTP-порт, а Long Poll-цикл никак не совместим с тем, что
   Render "усыпляет" процесс — усыплённый процесс не может сам стучаться
   наружу. С Callback API входящий запрос от VK — это как раз то, что
-  будит спящий сервис (см. подробности в конце файла).
+  будит спящий сервис.
 - Настройка на стороне VK: Группа -> Управление -> Работа с API ->
   Callback API -> Адрес: https://<твой-сервис>.onrender.com/callback
-  (путь может быть любым — сервер отвечает на POST на любой адрес).
   Код подтверждения и секретный ключ — в config.json (или переменных
   окружения VK_CALLBACK_CONFIRMATION / VK_CALLBACK_SECRET).
 
@@ -21,60 +20,14 @@ VK-бот: автомодератор на чистом ИИ + ранги мод
   rules_text).
 - ИИ решает: есть нарушение или нет, и если да — какое действие применить
   (warn / delete_and_warn / mute).
-- Бот НИКОГО не банит и не кикает — максимум наказание это временный мут
-  (симулируется удалением сообщений замьюченного, т.к. VK Bot API не умеет
-  native-мут для бесед). Длительность мута фиксированная, задаётся в
-  config.json -> mute_duration_minutes (для теста — 20 минут).
-- Повторные предупреждения (warnings_before_mute штук) тоже превращаются
-  в мут, а не в исключение из чата.
-- Репост (пересланная запись со стены чужого паблика/канала) наказывается
-  отдельно и без ИИ — сразу удаление + предупреждение со ссылкой на п. 3.1.
-- Каждое действие бота пишется в лог (storage.actions_log), модераторы могут
-  посмотреть его через /log и отменить через /revert.
-- При каждом наказании бот шлёт личное уведомление всем модераторам/
-  администраторам/владельцу (notify_staff).
-- Если ИИ недоступен или вернул ошибку — считается, что нарушения нет
-  (fail-safe, бот не наказывает "на всякий случай").
+- Бот НИКОГО не банит и не кикает — максимум наказание это временный мут.
+- Повторные предупреждения тоже превращаются в мут, а не в исключение.
+- Репост наказывается отдельно и без ИИ — сразу удаление + предупреждение.
+- Каждое действие бота пишется в лог, модераторы могут посмотреть и отменить.
+- При каждом наказании бот шлёт личное уведомление всем модераторам.
 
-Нашивки и антинашивки (achievements.py) выдаются полностью автоматически
-после каждого события и хранятся навсегда (см. сам файл achievements.py).
-Отдельно есть нашивки активности (ranks.ACTIVITY_RANKS) по числу сообщений.
-
-Ранги модераторов (config.json -> moderators, уровни 1-5):
-    1 — Модератор
-    2 — Старший модератор
-    3 — Младший администратор
-    4 — Старший администратор
-    5 — Владелец
-Управлять рангом (своим и чужим) может только тот, чей уровень строго выше.
-Модератора можно указать по числовому ID ({"id": ..., "level": ...}) или по
-короткому имени страницы ({"screen_name": "...", "level": ...}) — во втором
-случае бот сам определит числовой ID при старте и допишет его в config.json.
-
-Команды модераторов (доступны только участникам из moderators):
-    /log                    — последние 20 действий бота
-    /revert <id>            — отменить действие бота
-    /setrules <текст>       — задать/сменить текст правил чата (виден всем и
-                              используется как инструкция для ИИ)
-    /setrank <id> <уровень> — назначить ранг по числовому ID
-    /setrank <уровень>      — назначить ранг участнику, чьё сообщение
-                              зацитировано (ответом на его сообщение)
-
-Команды для всех:
-    правила       — показать текущие правила чата
-    мой профиль   — своя статистика + нашивки/антинашивки
-    статистика    — топ активности в чате за последние 24 часа
-
-Про бесплатный хостинг на Render (Web Service) и "засыпание":
-- Бесплатный тариф Render усыпляет процесс примерно через 15 минут без
-  входящих HTTP-запросов. Переход на Callback API снижает риск (VK сам
-  стучится к нам при каждом сообщении и разбудит спящий сервис), но первое
-  сообщение после сна всё равно может прийти с задержкой в 30-60 секунд,
-  пока Render поднимает контейнер.
-- Чтобы сервис вообще не засыпал — дополнительно подключи бесплатный
-  пинг-сервис (UptimeRobot / cron-job.org), который заходит на GET-адрес
-  сервиса каждые 5-10 минут. Это делает работу бота стабильной 24/7, а не
-  "лучше, чем было".
+Нашивки и антинашивки выдаются автоматически после каждого события.
+Ранги модераторов: уровни 1-5.
 """
 
 import json
@@ -83,7 +36,7 @@ import random
 import threading
 import time
 import traceback
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import vk_api
 
@@ -95,24 +48,13 @@ import achievements
 with open("config.json", "r", encoding="utf-8") as f:
     CONFIG = json.load(f)
 
-# Секреты (токены) берутся из переменных окружения Render — так они не хранятся
-# в самом коде на GitHub. Если переменной окружения нет (например, локальный
-# тест), используется значение из config.json как запасной вариант.
 VK_GROUP_TOKEN = os.environ.get("VK_GROUP_TOKEN") or CONFIG.get("vk_group_token")
 GROUP_ID = int(os.environ.get("VK_GROUP_ID") or CONFIG.get("group_id", 0))
 AI_API_KEY = os.environ.get("GROQ_API_KEY") or os.environ.get("AI_API_KEY") or CONFIG.get("ai", {}).get("api_key")
 
-# Данные Callback API (см. вкладку "Callback API" в настройках группы VK).
-# CONFIRMATION_CODE — строка, которую VK просит вернуть при подтверждении
-# адреса сервера ("Строка, которую должен вернуть сервер" на скрине).
-# CALLBACK_SECRET — необязательный секретный ключ; если задан в VK, VK кладёт
-# его в каждое событие (event["secret"]), и мы можем проверить, что запрос
-# действительно пришёл от VK, а не от кого-то постороннего.
 CONFIRMATION_CODE = os.environ.get("VK_CALLBACK_CONFIRMATION") or CONFIG.get("callback_confirmation_code")
 CALLBACK_SECRET = os.environ.get("VK_CALLBACK_SECRET") or CONFIG.get("callback_secret")
 
-# moderators: список объектов {"id":.., "level":..} (или {"screen_name":.., "level":..},
-# если числовой ID ещё не известен — см. resolve_moderators() ниже) -> словарь id -> level
 MODERATORS = {m["id"]: m["level"] for m in CONFIG.get("moderators", []) if m.get("id")}
 WARNINGS_BEFORE_MUTE = CONFIG.get("warnings_before_mute", 3)
 MUTE_DURATION_MINUTES = CONFIG.get("mute_duration_minutes", 20)
@@ -127,7 +69,7 @@ if not GROUP_ID:
 if not CONFIRMATION_CODE:
     raise RuntimeError(
         "Не найден код подтверждения Callback API. Задай VK_CALLBACK_CONFIRMATION "
-        "или config.json -> callback_confirmation_code (смотри вкладку Callback API в группе VK)."
+        "или config.json -> callback_confirmation_code."
     )
 
 vk_session = vk_api.VkApi(token=VK_GROUP_TOKEN)
@@ -141,11 +83,6 @@ def save_config():
 
 
 def resolve_moderators():
-    """Даёт возможность указать модератора в config.json по короткому имени
-    страницы (screen_name, например "lomtev_shadow12"), если числовой ID
-    ещё не известен. При старте бот сам определяет ID через VK API
-    (utils.resolveScreenName) и дозаписывает его в config.json — дальше
-    используется уже сохранённый числовой ID."""
     global MODERATORS
     changed = False
     for m in CONFIG.get("moderators", []):
@@ -158,8 +95,7 @@ def resolve_moderators():
                 changed = True
                 print(f"[moderators] {m['screen_name']} -> id{m['id']}")
             else:
-                print(f"[moderators] Не удалось определить ID для {m['screen_name']}, "
-                      f"проверь имя страницы")
+                print(f"[moderators] Не удалось определить ID для {m['screen_name']}")
         except vk_api.exceptions.ApiError as e:
             print(f"[moderators] Ошибка resolveScreenName для {m['screen_name']}: {e}")
     if changed:
@@ -171,8 +107,6 @@ resolve_moderators()
 
 
 def notify_staff(user_id: int, message_text: str, reason: str, action_taken: str):
-    """Личное уведомление каждому модератору/администратору/владельцу
-    (все, кто есть в MODERATORS) о нарушении — сразу, автоматически."""
     text = (
         f"🚨 Нарушение в чате\n"
         f"Участник: [id{user_id}|id{user_id}] (vk.com/id{user_id})\n"
@@ -188,8 +122,6 @@ def notify_staff(user_id: int, message_text: str, reason: str, action_taken: str
 
 
 def announce_new_achievements(peer_id: int, user_id: int, new_items):
-    """Объявляет в чате о новых нашивках/антинашивках сразу после того,
-    как achievements.check_achievements() их выдал."""
     for kind, code, name in new_items:
         if kind == "achievement":
             send_message(peer_id, f"🏆 [id{user_id}|Участник] получает нашивку: {name}!")
@@ -198,8 +130,6 @@ def announce_new_achievements(peer_id: int, user_id: int, new_items):
 
 
 def is_repost(message: dict) -> bool:
-    """True, если сообщение — пересланная запись (репост) со стены другого
-    паблика/канала, а не собственный текст автора."""
     for att in message.get("attachments", []):
         if att.get("type") == "wall":
             return True
@@ -210,7 +140,7 @@ def send_message(peer_id: int, text: str):
     vk.messages.send(
         peer_id=peer_id,
         message=text,
-        random_id=int(time.time() * 1000) % (10**9)
+        random_id=random.randint(1, 2**31 - 1)
     )
 
 
@@ -221,12 +151,9 @@ def delete_message(peer_id: int, message_id: int):
         print(f"Не удалось удалить сообщение: {e}")
 
 
-# ---------- Модерация (только предупреждение / мут, никогда бан) ----------
+# ---------- Модерация ----------
 
 def apply_mute(peer_id: int, user_id: int, reason: str):
-    """Мут симулируется: VK Bot API не даёт запретить писать конкретному
-    человеку в беседе, поэтому все его сообщения будут молча удаляться,
-    пока не истечёт until_ts."""
     until_ts = time.time() + MUTE_DURATION_MINUTES * 60
     storage.set_mute(user_id, until_ts)
     storage.reset_warnings(user_id)
@@ -260,11 +187,8 @@ def apply_punishment(action: str, peer_id: int, user_id: int, message_id: int, r
         apply_mute(peer_id, user_id, reason)
 
     storage.log_action(user_id, peer_id, message_id, action_taken, reason, text)
-
-    # Уведомляем модераторов/администратора/владельца в личку — автоматически
     notify_staff(user_id, text, reason, action_taken)
 
-    # Проверяем и сразу выдаём (навсегда) новые нашивки/антинашивки
     new_items = achievements.check_achievements(user_id)
     announce_new_achievements(peer_id, user_id, new_items)
 
@@ -322,12 +246,10 @@ def handle_moderator_command(peer_id: int, user_id: int, text: str, reply_to_use
             return
 
         arg = parts[1].strip()
-        # Вариант "/setrank 3" ответом на чьё-то сообщение
         if arg.isdigit() and reply_to_user_id is not None:
             target_id = reply_to_user_id
             level_str = arg
         else:
-            # Вариант "/setrank <id> <уровень>"
             arg_parts = arg.split(maxsplit=1)
             if len(arg_parts) < 2 or not arg_parts[0].isdigit():
                 send_message(peer_id, "Не понял команду. Либо ответь на сообщение участника и напиши "
@@ -353,7 +275,7 @@ def handle_moderator_command(peer_id: int, user_id: int, text: str, reply_to_use
         send_message(peer_id, f"[id{target_id}|Участник] теперь имеет ранг «{ranks.title(new_level)}».")
 
 
-# ---------- Публичные команды (доступны всем) ----------
+# ---------- Публичные команды ----------
 
 def handle_public_command(peer_id: int, user_id: int, lowered_text: str) -> bool:
     if lowered_text in ("правила", "правила чата", "покажи правила"):
@@ -396,11 +318,9 @@ def handle_public_command(peer_id: int, user_id: int, lowered_text: str) -> bool
     return False
 
 
-# ---------- Обработка одного сообщения (вызывается из Callback API) ----------
+# ---------- Обработка одного сообщения ----------
 
 def process_message(message: dict):
-    """Та же логика, что раньше крутилась в цикле Long Poll — теперь
-    вызывается один раз на каждое HTTP-событие message_new от VK."""
     peer_id = message["peer_id"]
     user_id = message["from_id"]
     message_id = message["id"]
@@ -414,16 +334,13 @@ def process_message(message: dict):
 
     lowered = text.strip().lower()
 
-    # Команды модераторов
     if text.startswith("/") and user_id in MODERATORS:
         handle_moderator_command(peer_id, user_id, text, reply_to_user_id)
         return
 
-    # Публичные команды (правила / профиль / статистика)
     if handle_public_command(peer_id, user_id, lowered):
         return
 
-    # Учитываем активность для статистики и нашивок (включая модераторов)
     prev_total = storage.get_user_total_messages(user_id)
     new_total = storage.bump_message_count(user_id, time.time())
     prev_threshold, _ = ranks.get_activity_rank_at(prev_total)
@@ -435,25 +352,16 @@ def process_message(message: dict):
             f"({new_total} сообщ.)!"
         )
 
-    # Нашивки/антинашивки за общее число сообщений (например "Ветеран чата",
-    # "Чистая репутация") проверяем после каждого сообщения — независимо
-    # от нашивок активности выше.
     announce_new_achievements(peer_id, user_id, achievements.check_achievements(user_id))
 
-    # Модераторов бот не наказывает
     if user_id in MODERATORS:
         return
 
-    # Если пользователь замьючен — просто молча удаляем сообщение,
-    # без повторного обращения к ИИ и без спама предупреждениями
     mute_until = storage.get_mute_until(user_id)
     if mute_until:
         delete_message(peer_id, message_id)
         return
 
-    # Репост (пересланная запись) из чужого паблика/канала — запрещено
-    # правилами (п. 3.1), проверяется без ИИ: удаляем, предупреждаем,
-    # указываем конкретный пункт правил.
     if is_repost(message):
         storage.increment_stat(user_id, "total_reposts_ever")
         apply_punishment(
@@ -468,7 +376,8 @@ def process_message(message: dict):
 
     ai_result = ai_moderation.check_with_ai(
         text, AI_RULES_DESCRIPTION, AI_API_KEY,
-        AI_CONFIG["model"], AI_CONFIG.get("fallback_model")
+        AI_CONFIG.get("model", "openai/gpt-oss-20b"),
+        AI_CONFIG.get("fallback_model")
     )
     if ai_result["violation"]:
         apply_punishment(
@@ -479,20 +388,16 @@ def process_message(message: dict):
 
 
 def process_message_safe(message: dict):
-    """Обёртка для запуска process_message в отдельном потоке — исключение
-    внутри не должно "тихо" убивать поток без следа в логах."""
     try:
         process_message(message)
     except Exception as e:
         print(f"[process_message] Необработанная ошибка: {e}")
+        traceback.print_exc()
 
 
-# ---------- HTTP-сервер: Callback API + health-check ----------
+# ---------- HTTP-сервер ----------
 
 class VkCallbackHandler(BaseHTTPRequestHandler):
-    """Принимает события Callback API от VK (POST) и заодно отвечает на
-    обычный GET — это нужно и для проверки в браузере, и для пинг-сервисов
-    (UptimeRobot и т.п.), которые не дают Render усыпить процесс."""
 
     def do_GET(self):
         self.send_response(200)
@@ -515,33 +420,31 @@ class VkCallbackHandler(BaseHTTPRequestHandler):
             event_type = event.get("type")
             print(f"[callback] Получено событие от VK: {event_type}")
 
-            # Подтверждение адреса сервера — обязательный первый шаг настройки
-            # Callback API в группе VK. Отвечаем строкой без кавычек, как требует VK.
             if event_type == "confirmation":
                 self.send_response(200)
                 self.send_header("Content-type", "text/plain; charset=utf-8")
                 self.end_headers()
                 self.wfile.write(CONFIRMATION_CODE.encode("utf-8"))
+                print(f"[callback] Отправлен код подтверждения: {CONFIRMATION_CODE}")
                 return
 
-            # Если задан секретный ключ в config.json — проверяем, что событие
-            # действительно от VK (защита от посторонних запросов на этот адрес).
             if CALLBACK_SECRET and event.get("secret") != CALLBACK_SECRET:
                 print("[callback] Событие с неверным secret — игнорируем")
                 self._respond_ok()
                 return
 
-            # Отвечаем VK "ok" сразу же, не дожидаясь обработки (проверка ИИ может
-            # занять пару секунд) — иначе VK решит, что доставка не удалась, и
-            # будет повторно слать то же событие.
             self._respond_ok()
 
             if event_type == "message_new":
                 message = event.get("object", {}).get("message", {})
+                if not message:
+                    print(f"[callback] message_new: пустой объект message, raw: {raw[:500]}")
+                    return
                 print(f"[callback] message_new: from_id={message.get('from_id')} "
                       f"text={message.get('text')!r}")
                 threading.Thread(target=process_message_safe, args=(message,), daemon=True).start()
-            # Остальные типы событий (message_edit, group_join и т.п.) пока не обрабатываем.
+            else:
+                print(f"[callback] Необрабатываемый тип события: {event_type}")
         except Exception:
             print("[callback] Необработанная ошибка в do_POST:")
             traceback.print_exc()
@@ -557,8 +460,6 @@ class VkCallbackHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"ok")
 
     def log_message(self, format, *args):
-        # Не засоряем логи запросами health-check пинг-сервиса (GET), но
-        # НЕ глушим ничего для POST — там могут быть реальные ошибки.
         if self.command == "GET":
             return
         print("[http] " + (format % args))
@@ -567,9 +468,10 @@ class VkCallbackHandler(BaseHTTPRequestHandler):
 def main():
     storage.init_db()
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), VkCallbackHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", port), VkCallbackHandler)
     print(f"Бот запущен (Callback API), слушаю порт {port}...")
-    print("Адрес для настройки в VK (Callback API): https://<твой-сервис>.onrender.com/ (любой путь)")
+    print(f"GROUP_ID={GROUP_ID}, модераторов={len(MODERATORS)}, ИИ включён={AI_CONFIG.get('enabled', False)}")
+    print(f"Адрес для настройки в VK: https://<твой-сервис>.onrender.com/ (любой путь)")
     server.serve_forever()
 
 
