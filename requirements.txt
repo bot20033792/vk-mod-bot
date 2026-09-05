@@ -1,3 +1,5 @@
 aiohttp
 vk_api
 requests
+groq
+
