@@ -1,6 +1,8 @@
 {
   "vk_group_token": "ВСТАВЬ_СЮДА_ТОКЕН_ГРУППЫ",
-  "group_id": 0,
+  "group_id": 241298107,
+  "callback_confirmation_code": "a78e3c98",
+  "callback_secret": "aaQ13axAPQEcczQa",
   "moderators": [
     {
       "id": 948950706,
