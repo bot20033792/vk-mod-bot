@@ -1,5 +1,6 @@
 """
-Хранилище на SQLite: предупреждения пользователей и лог действий бота.
+Хранилище на SQLite: предупреждения, лог действий бота, временные муты,
+статистика сообщений (для «мой профиль» и «статистика»).
 Файл базы: moderation.db (создаётся автоматически рядом с bot.py).
 """
 
@@ -7,6 +8,10 @@ import sqlite3
 import time
 
 DB_PATH = "moderation.db"
+
+# Не храним историю сообщений дольше этого срока (статистика нужна максимум
+# за последние сутки, но с запасом храним неделю на случай разбирательств).
+MESSAGE_LOG_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 
 def _connect():
@@ -36,9 +41,31 @@ def init_db():
             reverted_by INTEGER
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS mutes (
+            user_id INTEGER PRIMARY KEY,
+            until_ts REAL NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS message_counts (
+            user_id INTEGER PRIMARY KEY,
+            total_count INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS message_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            ts REAL NOT NULL
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_message_log_ts ON message_log (ts)")
     conn.commit()
     conn.close()
 
+
+# ---------- Предупреждения ----------
 
 def add_warning(user_id: int) -> int:
     """Увеличивает счётчик предупреждений пользователя и возвращает новое значение."""
@@ -60,6 +87,8 @@ def reset_warnings(user_id: int):
     conn.commit()
     conn.close()
 
+
+# ---------- Лог действий ----------
 
 def log_action(user_id: int, peer_id: int, message_id, action: str, reason: str, text: str):
     conn = _connect()
@@ -99,3 +128,74 @@ def mark_reverted(action_id: int, moderator_id: int) -> bool:
     conn.commit()
     conn.close()
     return True
+
+
+# ---------- Муты ----------
+
+def set_mute(user_id: int, until_ts: float):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO mutes (user_id, until_ts) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET until_ts = ?",
+        (user_id, until_ts, until_ts)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_mute_until(user_id: int):
+    """Возвращает timestamp окончания мута, если пользователь ещё замьючен,
+    иначе None (в том числе если мут уже истёк)."""
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("SELECT until_ts FROM mutes WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row is None:
+        return None
+    until_ts = row[0]
+    if until_ts <= time.time():
+        return None
+    return until_ts
+
+
+# ---------- Статистика сообщений ----------
+
+def bump_message_count(user_id: int, ts: float) -> int:
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO message_counts (user_id, total_count) VALUES (?, 1) "
+                "ON CONFLICT(user_id) DO UPDATE SET total_count = total_count + 1", (user_id,))
+    cur.execute("INSERT INTO message_log (user_id, ts) VALUES (?, ?)", (user_id, ts))
+    # Периодическая чистка старых записей лога сообщений, чтобы база не росла бесконечно
+    cur.execute("DELETE FROM message_log WHERE ts < ?", (ts - MESSAGE_LOG_RETENTION_SECONDS,))
+    conn.commit()
+    cur.execute("SELECT total_count FROM message_counts WHERE user_id = ?", (user_id,))
+    new_total = cur.fetchone()[0]
+    conn.close()
+    return new_total
+
+
+def get_user_total_messages(user_id: int) -> int:
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("SELECT total_count FROM message_counts WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def get_activity_last_hours(hours: int = 24, limit: int = 15):
+    """Список (user_id, количество сообщений) за последние N часов, по убыванию."""
+    since = time.time() - hours * 60 * 60
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id, COUNT(*) as cnt FROM message_log WHERE ts >= ? "
+        "GROUP BY user_id ORDER BY cnt DESC LIMIT ?",
+        (since, limit)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
