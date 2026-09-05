@@ -1,3 +1,24 @@
+import os
+import threading
+import time
+import requests
+
+# --- НАЧАЛО БЛОКА ДЛЯ ПОДДЕРЖКИ ОНЛАЙНА ---
+def keep_alive():
+    while True:
+        try:
+            url = "https://vk-mod-bot-e8ee.onrender.com"
+            requests.get(url, timeout=5)
+            print("Keep-alive ping sent")
+        except Exception as e:
+            print(f"Keep-alive error: {e}")
+        time.sleep(300)  # Пингуем каждые 5 минут
+
+threading.Thread(target=keep_alive, daemon=True).start()
+# --- КОНЕЦ БЛОКА ---
+
+
+
 """
 VK-бот: автомодератор на чистом ИИ + ранги модераторов + профиль/статистика.
 
